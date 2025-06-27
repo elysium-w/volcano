@@ -17,13 +17,16 @@ limitations under the License.
 package capacity
 
 import (
+	"context"
 	"fmt"
 	"math"
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
+	k8sframework "k8s.io/kubernetes/pkg/scheduler/framework"
 
 	"volcano.sh/apis/pkg/apis/scheduling"
+
 	"volcano.sh/volcano/pkg/scheduler/api"
 	"volcano.sh/volcano/pkg/scheduler/api/helpers"
 	"volcano.sh/volcano/pkg/scheduler/framework"
@@ -32,8 +35,12 @@ import (
 )
 
 const (
-	PluginName  = "capacity"
-	rootQueueID = "root"
+	PluginName = "capacity"
+
+	// preFilterStateKey is the key in CycleState to InterPodAffinity pre-computed data for Filtering.
+	// Using the name of the plugin will likely help us avoid collisions with other plugins.
+	capacityStateKey = PluginName
+	rootQueueID      = "root"
 )
 
 type capacityPlugin struct {
@@ -123,11 +130,6 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 				allocations[job.Queue] = attr.allocated.Clone()
 			}
 			allocated := allocations[job.Queue]
-			if allocated.LessPartly(reclaimer.Resreq, api.Zero) {
-				klog.V(3).Infof("Failed to allocate resource for Task <%s/%s> in Queue <%s>, not enough resource.",
-					reclaimee.Namespace, reclaimee.Name, job.Queue)
-				continue
-			}
 
 			exceptReclaimee := allocated.Clone().Sub(reclaimee.Resreq)
 			// When scalar resource not specified in deserved such as "pods", we should skip it and consider it as infinity,
@@ -150,6 +152,10 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 
 		queue := obj.(*api.QueueInfo)
 		task := candidate.(*api.TaskInfo)
+		if queue.Queue.Status.State != scheduling.QueueStateOpen {
+			klog.V(3).Infof("Queue <%s> current state: %s, is not open state, can not reclaim for <%s>.", queue.Name, queue.Queue.Status.State, task.Name)
+			return false
+		}
 		attr := cp.queueOpts[queue.UID]
 
 		futureUsed := attr.allocated.Clone().Add(task.Resreq)
@@ -165,18 +171,11 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 		return !overused
 	})
 
-	queueAllocatable := func(queue *api.QueueInfo, candidate *api.TaskInfo) bool {
-		attr := cp.queueOpts[queue.UID]
-		futureUsed := attr.allocated.Clone().Add(candidate.Resreq)
-		allocatable := futureUsed.LessEqualWithDimension(attr.realCapability, candidate.Resreq)
-		if !allocatable {
-			klog.V(3).Infof("Queue <%v>: realCapability <%v>, allocated <%v>; Candidate <%v>: resource request <%v>",
-				queue.Name, attr.realCapability, attr.allocated, candidate.Name, candidate.Resreq)
-		}
-		return allocatable
-	}
-
 	ssn.AddAllocatableFn(cp.Name(), func(queue *api.QueueInfo, candidate *api.TaskInfo) bool {
+		if queue.Queue.Status.State != scheduling.QueueStateOpen {
+			klog.V(3).Infof("Queue <%s> current state: %s, cannot allocate task <%s>.", queue.Name, queue.Queue.Status.State, candidate.Name)
+			return false
+		}
 		if !readyToSchedule {
 			klog.V(3).Infof("Capacity plugin failed to check queue's hierarchical structure!")
 			return false
@@ -185,18 +184,8 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 			klog.V(3).Infof("Queue <%s> is not a leaf queue, can not allocate task <%s>.", queue.Name, candidate.Name)
 			return false
 		}
-		list := append(cp.queueOpts[queue.UID].ancestors, queue.UID)
-		for i := len(list) - 1; i >= 0; i-- {
-			if !queueAllocatable(ssn.Queues[list[i]], candidate) {
-				if klog.V(5).Enabled() {
-					for i--; i >= 0; i-- {
-						queueAllocatable(ssn.Queues[list[i]], candidate)
-					}
-				}
-				return false
-			}
-		}
-		return true
+
+		return cp.checkQueueAllocatableHierarchically(ssn, queue, candidate)
 	})
 
 	ssn.AddJobEnqueueableFn(cp.Name(), func(obj interface{}) int {
@@ -213,6 +202,11 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 
 		attr := cp.queueOpts[queueID]
 		queue := ssn.Queues[queueID]
+		// If the queue is not open, do not enqueue
+		if queue.Queue.Status.State != scheduling.QueueStateOpen {
+			klog.V(3).Infof("Queue <%s> current state: %s, is not open state, reject job <%s/%s>.", queue.Name, queue.Queue.Status.State, job.Namespace, job.Name)
+			return util.Reject
+		}
 		// If no capability is set, always enqueue the job.
 		if attr.realCapability == nil {
 			klog.V(4).Infof("Capability of queue <%s> was not set, allow job <%s/%s> to Inqueue.",
@@ -224,21 +218,113 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 			klog.V(4).Infof("job %s MinResources is null.", job.Name)
 			return util.Permit
 		}
-		minReq := job.GetMinResources()
 
-		klog.V(5).Infof("job %s min resource <%s>, queue %s capability <%s> allocated <%s> inqueue <%s> elastic <%s>",
-			job.Name, minReq.String(), queue.Name, attr.realCapability.String(), attr.allocated.String(), attr.inqueue.String(), attr.elastic.String())
-		// The queue resource quota limit has not reached
-		r := minReq.Clone().Add(attr.allocated).Add(attr.inqueue).Sub(attr.elastic)
-
-		inqueue := r.LessEqualWithDimension(attr.realCapability, minReq)
-		klog.V(5).Infof("job %s inqueue %v", job.Name, inqueue)
-		if inqueue {
-			attr.inqueue.Add(job.DeductSchGatedResources(minReq))
-			return util.Permit
+		if !cp.checkJobEnqueueableHierarchically(ssn, queue, job) {
+			return util.Reject
 		}
-		ssn.RecordPodGroupEvent(job.PodGroup, v1.EventTypeNormal, string(scheduling.PodGroupUnschedulableType), "queue resource quota insufficient")
-		return util.Reject
+
+		// job enqueued
+		deductedResources := job.DeductSchGatedResources(job.GetMinResources())
+		attr.inqueue.Add(deductedResources)
+		// If enable hierarchy, update the inqueue resource for all ancestors queues
+		if hierarchyEnabled {
+			for _, ancestorID := range attr.ancestors {
+				ancestorAttr := cp.queueOpts[ancestorID]
+				ancestorAttr.inqueue.Add(deductedResources)
+			}
+		}
+		klog.V(5).Infof("job <%s/%s> enqueued", job.Namespace, job.Name)
+		return util.Permit
+	})
+
+	ssn.AddPrePredicateFn(cp.Name(), func(task *api.TaskInfo) error {
+		state := &capacityState{
+			queueAttrs: make(map[api.QueueID]*queueAttr),
+		}
+
+		for _, queue := range cp.queueOpts {
+			state.queueAttrs[queue.queueID] = queue.Clone()
+		}
+
+		ssn.GetCycleState(task.UID).Write(capacityStateKey, state)
+		return nil
+	})
+
+	ssn.AddSimulateAddTaskFn(cp.Name(), func(ctx context.Context, cycleState *k8sframework.CycleState, taskToSchedule *api.TaskInfo, taskToAdd *api.TaskInfo, nodeInfo *api.NodeInfo) error {
+		state, err := getCapacityState(cycleState)
+		if err != nil {
+			return fmt.Errorf("failed to get capacity state: %w", err)
+		}
+
+		job := ssn.Jobs[taskToAdd.Job]
+		attr := state.queueAttrs[job.Queue]
+		if attr == nil {
+			return fmt.Errorf("queue %s not found", job.Queue)
+		}
+		attr.allocated.Add(taskToAdd.Resreq)
+		updateQueueAttrShare(attr)
+		if hierarchyEnabled {
+			for _, ancestorID := range attr.ancestors {
+				ancestorAttr := state.queueAttrs[ancestorID]
+				ancestorAttr.allocated.Add(taskToAdd.Resreq)
+			}
+		}
+		return nil
+	})
+
+	ssn.AddSimulateRemoveTaskFn(cp.Name(), func(ctx context.Context, cycleState *k8sframework.CycleState, taskToSchedule *api.TaskInfo, taskToRemove *api.TaskInfo, nodeInfo *api.NodeInfo) error {
+		state, err := getCapacityState(cycleState)
+		if err != nil {
+			return fmt.Errorf("failed to get capacity state: %w", err)
+		}
+		job := ssn.Jobs[taskToRemove.Job]
+		attr := state.queueAttrs[job.Queue]
+		if attr == nil {
+			return fmt.Errorf("queue %s not found", job.Queue)
+		}
+		attr.allocated.Sub(taskToRemove.Resreq)
+		updateQueueAttrShare(attr)
+		if hierarchyEnabled {
+			for _, ancestorID := range attr.ancestors {
+				ancestorAttr := state.queueAttrs[ancestorID]
+				ancestorAttr.allocated.Sub(taskToRemove.Resreq)
+			}
+		}
+		return nil
+	})
+
+	ssn.AddSimulateAllocatableFn(cp.Name(), func(ctx context.Context, cycleState *k8sframework.CycleState, queue *api.QueueInfo, candidate *api.TaskInfo) bool {
+		state, err := getCapacityState(cycleState)
+		if err != nil {
+			return false
+		}
+
+		if !readyToSchedule {
+			klog.V(3).Infof("Capacity plugin failed to check queue's hierarchical structure!")
+			return false
+		}
+		if hierarchyEnabled && !cp.isLeafQueue(queue.UID) {
+			klog.V(3).Infof("Queue <%s> is not a leaf queue, can not allocate task <%s>.", queue.Name, candidate.Name)
+			return false
+		}
+
+		simulateQueueAllocatable := func(state *capacityState, queue *api.QueueInfo, candidate *api.TaskInfo) bool {
+			attr := state.queueAttrs[queue.UID]
+			return queueAllocatable(attr, candidate, queue)
+		}
+
+		list := append(state.queueAttrs[queue.UID].ancestors, queue.UID)
+		for i := len(list) - 1; i >= 0; i-- {
+			if !simulateQueueAllocatable(state, ssn.Queues[list[i]], candidate) {
+				if klog.V(5).Enabled() {
+					for i--; i >= 0; i-- {
+						simulateQueueAllocatable(state, ssn.Queues[list[i]], candidate)
+					}
+				}
+				return false
+			}
+		}
+		return true
 	})
 
 	// Register event handlers.
@@ -247,7 +333,7 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 			job := ssn.Jobs[event.Task.Job]
 			attr := cp.queueOpts[job.Queue]
 			attr.allocated.Add(event.Task.Resreq)
-			metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory)
+			metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory, attr.allocated.ScalarResources)
 
 			cp.updateShare(attr)
 			if hierarchyEnabled {
@@ -264,7 +350,7 @@ func (cp *capacityPlugin) OnSessionOpen(ssn *framework.Session) {
 			job := ssn.Jobs[event.Task.Job]
 			attr := cp.queueOpts[job.Queue]
 			attr.allocated.Sub(event.Task.Resreq)
-			metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory)
+			metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory, attr.allocated.ScalarResources)
 
 			cp.updateShare(attr)
 			if hierarchyEnabled {
@@ -325,6 +411,7 @@ func (cp *capacityPlugin) buildQueueAttrs(ssn *framework.Session) {
 			}
 			realCapability := api.ExceededPart(cp.totalResource, cp.totalGuarantee).Add(attr.guarantee)
 			if attr.capability == nil {
+				attr.capability = api.EmptyResource()
 				attr.realCapability = realCapability
 			} else {
 				realCapability.MinDimensionResource(attr.capability, api.Infinity)
@@ -372,8 +459,6 @@ func (cp *capacityPlugin) buildQueueAttrs(ssn *framework.Session) {
 		if attr.realCapability != nil {
 			attr.deserved.MinDimensionResource(attr.realCapability, api.Infinity)
 		}
-		// When scalar resource not specified in deserved such as "pods", we should skip it and consider deserved resource as infinity.
-		attr.deserved.MinDimensionResource(attr.request, api.Infinity)
 
 		attr.deserved = helpers.Max(attr.deserved, attr.guarantee)
 		cp.updateShare(attr)
@@ -385,19 +470,36 @@ func (cp *capacityPlugin) buildQueueAttrs(ssn *framework.Session) {
 	for queueID, queueInfo := range ssn.Queues {
 		queue := ssn.Queues[queueID]
 		if attr, ok := cp.queueOpts[queueID]; ok {
-			metrics.UpdateQueueDeserved(attr.name, attr.deserved.MilliCPU, attr.deserved.Memory)
-			metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory)
-			metrics.UpdateQueueRequest(attr.name, attr.request.MilliCPU, attr.request.Memory)
+			metrics.UpdateQueueDeserved(attr.name, attr.deserved.MilliCPU, attr.deserved.Memory, attr.deserved.ScalarResources)
+			metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory, attr.allocated.ScalarResources)
+			metrics.UpdateQueueRequest(attr.name, attr.request.MilliCPU, attr.request.Memory, attr.request.ScalarResources)
+			if attr.capability != nil {
+				metrics.UpdateQueueCapacity(attr.name, attr.capability.MilliCPU, attr.capability.Memory, attr.capability.ScalarResources)
+			}
+			metrics.UpdateQueueRealCapacity(attr.name, attr.realCapability.MilliCPU, attr.realCapability.Memory, attr.realCapability.ScalarResources)
 			continue
 		}
-		deservedCPU, deservedMem := 0.0, 0.0
+		deservedCPU, deservedMem, scalarResources := 0.0, 0.0, map[v1.ResourceName]float64{}
 		if queue.Queue.Spec.Deserved != nil {
-			deservedCPU = float64(queue.Queue.Spec.Deserved.Cpu().MilliValue())
-			deservedMem = float64(queue.Queue.Spec.Deserved.Memory().Value())
+			attr := api.NewResource(queue.Queue.Spec.Deserved)
+			deservedCPU = attr.MilliCPU
+			deservedMem = attr.Memory
+			scalarResources = attr.ScalarResources
 		}
-		metrics.UpdateQueueDeserved(queueInfo.Name, deservedCPU, deservedMem)
-		metrics.UpdateQueueAllocated(queueInfo.Name, 0, 0)
-		metrics.UpdateQueueRequest(queueInfo.Name, 0, 0)
+		metrics.UpdateQueueDeserved(queueInfo.Name, deservedCPU, deservedMem, scalarResources)
+		metrics.UpdateQueueAllocated(queueInfo.Name, 0, 0, map[v1.ResourceName]float64{})
+		metrics.UpdateQueueRequest(queueInfo.Name, 0, 0, map[v1.ResourceName]float64{})
+		guarantee := api.EmptyResource()
+		if len(queue.Queue.Spec.Guarantee.Resource) != 0 {
+			guarantee = api.NewResource(queue.Queue.Spec.Guarantee.Resource)
+		}
+		realCapacity := api.ExceededPart(cp.totalResource, cp.totalGuarantee).Add(guarantee)
+		if len(queue.Queue.Spec.Capability) > 0 {
+			capacity := api.NewResource(queue.Queue.Spec.Capability)
+			realCapacity.MinDimensionResource(capacity, api.Infinity)
+			metrics.UpdateQueueCapacity(queueInfo.Name, capacity.MilliCPU, capacity.Memory, capacity.ScalarResources)
+		}
+		metrics.UpdateQueueRealCapacity(queueInfo.Name, realCapacity.MilliCPU, realCapacity.Memory, realCapacity.ScalarResources)
 	}
 
 	ssn.AddQueueOrderFn(cp.Name(), func(l, r interface{}) int {
@@ -520,9 +622,9 @@ func (cp *capacityPlugin) buildHierarchicalQueueAttrs(ssn *framework.Session) bo
 	// Record metrics
 	for queueID := range ssn.Queues {
 		attr := cp.queueOpts[queueID]
-		metrics.UpdateQueueDeserved(attr.name, attr.deserved.MilliCPU, attr.deserved.Memory)
-		metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory)
-		metrics.UpdateQueueRequest(attr.name, attr.request.MilliCPU, attr.request.Memory)
+		metrics.UpdateQueueDeserved(attr.name, attr.deserved.MilliCPU, attr.deserved.Memory, attr.deserved.ScalarResources)
+		metrics.UpdateQueueAllocated(attr.name, attr.allocated.MilliCPU, attr.allocated.Memory, attr.allocated.ScalarResources)
+		metrics.UpdateQueueRequest(attr.name, attr.request.MilliCPU, attr.request.Memory, attr.request.ScalarResources)
 	}
 
 	ssn.AddQueueOrderFn(cp.Name(), func(l, r interface{}) int {
@@ -676,8 +778,9 @@ func (cp *capacityPlugin) checkHierarchicalQueue(attr *queueAttr) error {
 	}
 
 	for _, childAttr := range attr.children {
-		realCapability := attr.realCapability.Clone().Sub(totalGuarantee).Add(childAttr.guarantee)
+		realCapability := api.ExceededPart(attr.realCapability, totalGuarantee).Add(childAttr.guarantee)
 		if childAttr.capability == nil {
+			childAttr.capability = api.EmptyResource()
 			childAttr.realCapability = realCapability
 		} else {
 			realCapability.MinDimensionResource(childAttr.capability, api.Infinity)
@@ -685,7 +788,6 @@ func (cp *capacityPlugin) checkHierarchicalQueue(attr *queueAttr) error {
 		}
 		oldDeserved := childAttr.deserved.Clone()
 		childAttr.deserved.MinDimensionResource(childAttr.realCapability, api.Infinity)
-		childAttr.deserved.MinDimensionResource(childAttr.request, api.Zero)
 
 		childAttr.deserved = helpers.Max(childAttr.deserved, childAttr.guarantee)
 		totalDeserved.Sub(oldDeserved).Add(childAttr.deserved)
@@ -712,18 +814,78 @@ func (cp *capacityPlugin) checkHierarchicalQueue(attr *queueAttr) error {
 }
 
 func (cp *capacityPlugin) updateShare(attr *queueAttr) {
-	res := float64(0)
-
-	for _, rn := range attr.deserved.ResourceNames() {
-		res = max(res, helpers.Share(attr.allocated.Get(rn), attr.deserved.Get(rn)))
-	}
-
-	attr.share = res
+	updateQueueAttrShare(attr)
 	metrics.UpdateQueueShare(attr.name, attr.share)
 }
 
 func (cp *capacityPlugin) isLeafQueue(queueID api.QueueID) bool {
 	return len(cp.queueOpts[queueID].children) == 0
+}
+
+func (cp *capacityPlugin) queueAllocatable(queue *api.QueueInfo, candidate *api.TaskInfo) bool {
+	attr := cp.queueOpts[queue.UID]
+	return queueAllocatable(attr, candidate, queue)
+}
+
+func queueAllocatable(attr *queueAttr, candidate *api.TaskInfo, queue *api.QueueInfo) bool {
+	futureUsed := attr.allocated.Clone().Add(candidate.Resreq)
+	allocatable := futureUsed.LessEqualWithDimension(attr.realCapability, candidate.Resreq)
+	if !allocatable {
+		klog.V(3).Infof("Queue <%v>: realCapability <%v>, allocated <%v>; Candidate <%v>: resource request <%v>",
+			queue.Name, attr.realCapability, attr.allocated, candidate.Name, candidate.Resreq)
+	}
+
+	return allocatable
+}
+
+func (cp *capacityPlugin) checkQueueAllocatableHierarchically(ssn *framework.Session, queue *api.QueueInfo, candidate *api.TaskInfo) bool {
+	// If hierarchical queue is not enabled, list will only contain the queue itself.
+	list := append(cp.queueOpts[queue.UID].ancestors, queue.UID)
+	// Check whether the candidate task can be allocated to the queue and all its ancestors.
+	for i := len(list) - 1; i >= 0; i-- {
+		if !cp.queueAllocatable(ssn.Queues[list[i]], candidate) {
+			// If log level is 5, print the information of all queues from leaf to ancestor.
+			if klog.V(5).Enabled() {
+				for j := i - 1; j >= 0; j-- {
+					cp.queueAllocatable(ssn.Queues[list[j]], candidate)
+				}
+			}
+			return false
+		}
+	}
+	return true
+}
+
+func (cp *capacityPlugin) jobEnqueueable(queue *api.QueueInfo, job *api.JobInfo) bool {
+	attr := cp.queueOpts[queue.UID]
+	minReq := job.GetMinResources()
+
+	klog.V(5).Infof("job %s min resource <%s>, queue %s capability <%s> allocated <%s> inqueue <%s> elastic <%s>",
+		job.Name, minReq.String(), queue.Name, attr.realCapability.String(), attr.allocated.String(), attr.inqueue.String(), attr.elastic.String())
+	// The queue resource quota limit has not reached
+	r := minReq.Clone().Add(attr.allocated).Add(attr.inqueue).Sub(attr.elastic)
+
+	return r.LessEqualWithDimension(attr.realCapability, minReq)
+}
+
+func (cp *capacityPlugin) checkJobEnqueueableHierarchically(ssn *framework.Session, queue *api.QueueInfo, job *api.JobInfo) bool {
+	// If hierarchical queue is not enabled, list will only contain the queue itself.
+	list := append(cp.queueOpts[queue.UID].ancestors, queue.UID)
+	// Check whether the job can be enqueued to the queue and all its ancestors.
+	for i := len(list) - 1; i >= 0; i-- {
+		if !cp.jobEnqueueable(ssn.Queues[list[i]], job) {
+			// If log level is 5, print the information of all queues from leaf to ancestor.
+			if klog.V(5).Enabled() {
+				for j := i - 1; j >= 0; j-- {
+					cp.jobEnqueueable(ssn.Queues[list[j]], job)
+				}
+			}
+			ssn.RecordPodGroupEvent(job.PodGroup, v1.EventTypeNormal, string(scheduling.PodGroupUnschedulableType), "queue resource quota insufficient")
+			return false
+		}
+	}
+
+	return true
 }
 
 func getQueueLevel(l *queueAttr, r *queueAttr) int {
@@ -738,4 +900,80 @@ func getQueueLevel(l *queueAttr, r *queueAttr) int {
 	}
 
 	return level
+}
+
+func getCapacityState(cycleState *k8sframework.CycleState) (*capacityState, error) {
+	c, err := cycleState.Read(capacityStateKey)
+	if err != nil {
+		// preFilterState doesn't exist, likely PreFilter wasn't invoked.
+		return nil, fmt.Errorf("error reading %q from cycleState: %w", capacityStateKey, err)
+	}
+
+	s, ok := c.(*capacityState)
+	if !ok {
+		return nil, fmt.Errorf("%+v  convert to capacity.state error", c)
+	}
+	return s, nil
+}
+
+type capacityState struct {
+	queueAttrs map[api.QueueID]*queueAttr
+}
+
+func (qa *queueAttr) Clone() *queueAttr {
+	if qa == nil {
+		return nil
+	}
+
+	cloned := &queueAttr{
+		queueID:        qa.queueID,
+		name:           qa.name,
+		share:          qa.share,
+		deserved:       qa.deserved.Clone(),
+		allocated:      qa.allocated.Clone(),
+		request:        qa.request.Clone(),
+		elastic:        qa.elastic.Clone(),
+		inqueue:        qa.inqueue.Clone(),
+		capability:     qa.capability.Clone(),
+		realCapability: qa.realCapability.Clone(),
+		guarantee:      qa.guarantee.Clone(),
+		children:       make(map[api.QueueID]*queueAttr),
+	}
+
+	if len(qa.ancestors) > 0 {
+		cloned.ancestors = make([]api.QueueID, len(qa.ancestors))
+		copy(cloned.ancestors, qa.ancestors)
+	}
+
+	for childID, childNode := range qa.children {
+		cloned.children[childID] = childNode.Clone()
+	}
+
+	return cloned
+}
+
+func (s *capacityState) Clone() k8sframework.StateData {
+	if s == nil {
+		return nil
+	}
+
+	newState := &capacityState{
+		queueAttrs: make(map[api.QueueID]*queueAttr, len(s.queueAttrs)),
+	}
+
+	for qID, qa := range s.queueAttrs {
+		newState.queueAttrs[qID] = qa.Clone()
+	}
+
+	return newState
+}
+
+func updateQueueAttrShare(attr *queueAttr) {
+	res := float64(0)
+
+	for _, rn := range attr.deserved.ResourceNames() {
+		res = max(res, helpers.Share(attr.allocated.Get(rn), attr.deserved.Get(rn)))
+	}
+
+	attr.share = res
 }

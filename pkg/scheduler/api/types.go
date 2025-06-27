@@ -17,6 +17,8 @@ limitations under the License.
 package api
 
 import (
+	"context"
+	"errors"
 	"strings"
 
 	k8sframework "k8s.io/kubernetes/pkg/scheduler/framework"
@@ -165,8 +167,44 @@ type Status struct {
 }
 
 // String represents status string
-func (s Status) String() string {
+func (s *Status) String() string {
 	return s.Reason
+}
+
+// IsSuccess returns true if and only if "Status" is nil or Code is "Success".
+func (s *Status) IsSuccess() bool {
+	return s == nil || s.Code == Success
+}
+
+// IsWait returns true if and only if "Status" is nil or Code is "Wait".
+func (s *Status) IsWait() bool {
+	return s.Code == Wait
+}
+
+// IsSkip returns true if and only if "Status" is nil or Code is "Skip".
+func (s *Status) IsSkip() bool {
+	return s.Code == Skip
+}
+
+// AsError returns nil if the status is a success, a wait or a skip; otherwise returns an "error" object
+// with a concatenated message on reasons of the Status.
+func (s *Status) AsError() error {
+	if s.IsSuccess() || s.IsWait() || s.IsSkip() {
+		return nil
+	}
+
+	return errors.New(s.String())
+}
+
+// AsStatus wraps an error in a Status.
+func AsStatus(err error) *Status {
+	if err == nil {
+		return nil
+	}
+	return &Status{
+		Code:   Error,
+		Reason: err.Error(),
+	}
 }
 
 type StatusSets []*Status
@@ -288,6 +326,9 @@ type EvictableFn func(*TaskInfo, []*TaskInfo) ([]*TaskInfo, int)
 // NodeOrderFn is the func declaration used to get priority score for a node for a particular task.
 type NodeOrderFn func(*TaskInfo, *NodeInfo) (float64, error)
 
+// HyperNodeOrderFn is the func declaration used to score hyperNodes for job.
+type HyperNodeOrderFn func(*JobInfo, map[string][]*NodeInfo) (map[string]float64, error)
+
 // BatchNodeOrderFn is the func declaration used to get priority score for ALL nodes for a particular task.
 type BatchNodeOrderFn func(*TaskInfo, []*NodeInfo) (map[string]float64, error)
 
@@ -299,6 +340,9 @@ type NodeReduceFn func(*TaskInfo, k8sframework.NodeScoreList) error
 
 // NodeOrderMapFn is the func declaration used to get priority score of all plugins for a node for a particular task.
 type NodeOrderMapFn func(*TaskInfo, *NodeInfo) (map[string]float64, float64, error)
+
+// HyperNodeOrderMapFn is the func declaration used to get priority score of all plugins for a hyperNode for a particular job.
+type HyperNodeOrderMapFn func(*JobInfo, map[string][]*NodeInfo) (map[string]map[string]float64, error)
 
 // NodeOrderReduceFn is the func declaration used to reduce priority score of all nodes for a plugin for a particular task.
 type NodeOrderReduceFn func(*TaskInfo, map[string]k8sframework.NodeScoreList) (map[string]float64, error)
@@ -314,3 +358,17 @@ type VictimTasksFn func([]*TaskInfo) []*TaskInfo
 
 // AllocatableFn is the func declaration used to check whether the task can be allocated
 type AllocatableFn func(*QueueInfo, *TaskInfo) bool
+
+// SimulateRemoveTaskFn is the func declaration used to simulate the result of removing a task from a node.
+type SimulateRemoveTaskFn func(ctx context.Context, state *k8sframework.CycleState, taskToSchedule *TaskInfo, taskInfoToRemove *TaskInfo, nodeInfo *NodeInfo) error
+
+// SimulateAddTaskFn is the func declaration used to simulate the result of adding a task to a node.
+type SimulateAddTaskFn func(ctx context.Context, state *k8sframework.CycleState, taskToSchedule *TaskInfo, taskInfoToAdd *TaskInfo, nodeInfo *NodeInfo) error
+
+// Simulate the predicate check for a task on a node.
+// Plugins implement this function to verify if the task can be scheduled to the node while maintaining topology constraints
+type SimulatePredicateFn func(ctx context.Context, state *k8sframework.CycleState, task *TaskInfo, nodeInfo *NodeInfo) error
+
+// Simulate the allocatable check for a node
+// Plugins implement this function to verify if the queue has enough resources to schedule the task while maintaining topology constraints
+type SimulateAllocatableFn func(ctx context.Context, state *k8sframework.CycleState, queue *QueueInfo, task *TaskInfo) bool

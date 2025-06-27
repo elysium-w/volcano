@@ -23,8 +23,8 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"gopkg.in/yaml.v2"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 
@@ -90,30 +90,18 @@ var _ = Describe("Job E2E Test", func() {
 	It("schedule high priority job with preemption when idle resource is NOT enough but preemptee resource is enough", func() {
 		// Remove enqueue action first because it conflicts with preempt.
 		cmc := e2eutil.NewConfigMapCase("volcano-system", "integration-scheduler-configmap")
-		cmc.ChangeBy(func(data map[string]string) (changed bool, changedBefore map[string]string) {
-			vcScheConfStr, ok := data["volcano-scheduler-ci.conf"]
-			Expect(ok).To(BeTrue())
-
-			schedulerConf := &e2eutil.SchedulerConfiguration{}
-			err := yaml.Unmarshal([]byte(vcScheConfStr), schedulerConf)
-			Expect(err).NotTo(HaveOccurred())
-
-			changed = true
-			newActions := strings.TrimPrefix(schedulerConf.Actions, "enqueue, ")
-			if newActions == schedulerConf.Actions {
-				changed = false
+		modifier := func(sc *e2eutil.SchedulerConfiguration) bool {
+			newActions := strings.TrimPrefix(sc.Actions, "enqueue, ")
+			if newActions == sc.Actions {
 				klog.Warning("There is already no enqueue action")
-				return
+				return false
 			}
 
-			schedulerConf.Actions = newActions
-			newVCScheConfBytes, err := yaml.Marshal(schedulerConf)
-			Expect(err).NotTo(HaveOccurred())
-
-			changedBefore = make(map[string]string)
-			changedBefore["volcano-scheduler-ci.conf"] = vcScheConfStr
-			data["volcano-scheduler-ci.conf"] = string(newVCScheConfBytes)
-			return
+			sc.Actions = newActions
+			return true
+		}
+		cmc.ChangeBy(func(data map[string]string) (changed bool, changedBefore map[string]string) {
+			return e2eutil.ModifySchedulerConfig(data, modifier)
 		})
 		defer cmc.UndoChanged()
 
@@ -222,16 +210,8 @@ var _ = Describe("Job E2E Test", func() {
 
 	It("preemption only works in the same queue", func() {
 		cmc := e2eutil.NewConfigMapCase("volcano-system", "integration-scheduler-configmap")
-		cmc.ChangeBy(func(data map[string]string) (changed bool, changedBefore map[string]string) {
-			vcScheConfStr, ok := data["volcano-scheduler-ci.conf"]
-			Expect(ok).To(BeTrue())
-
-			schedulerConf := &e2eutil.SchedulerConfiguration{}
-			err := yaml.Unmarshal([]byte(vcScheConfStr), schedulerConf)
-			Expect(err).NotTo(HaveOccurred())
-
-			changed = true
-			actions := strings.Split(schedulerConf.Actions, ",")
+		modifier := func(sc *e2eutil.SchedulerConfiguration) bool {
+			actions := strings.Split(sc.Actions, ",")
 			newActions := make([]string, 0)
 			// remove reclaim action
 			for _, action := range actions {
@@ -242,19 +222,13 @@ var _ = Describe("Job E2E Test", func() {
 			}
 
 			if len(newActions) == len(actions) {
-				changed = false
 				klog.Warning("There is already no reclaim action")
-				return
+				return false
 			}
-
-			schedulerConf.Actions = strings.Join(newActions, ", ")
-			newVCScheConfBytes, err := yaml.Marshal(schedulerConf)
-			Expect(err).NotTo(HaveOccurred())
-
-			changedBefore = make(map[string]string)
-			changedBefore["volcano-scheduler-ci.conf"] = vcScheConfStr
-			data["volcano-scheduler-ci.conf"] = string(newVCScheConfBytes)
-			return
+			return true
+		}
+		cmc.ChangeBy(func(data map[string]string) (changed bool, changedBefore map[string]string) {
+			return e2eutil.ModifySchedulerConfig(data, modifier)
 		})
 		defer cmc.UndoChanged()
 
@@ -418,30 +392,18 @@ var _ = Describe("Job E2E Test", func() {
 	It("Jobs unschedulable due to scheduling gates will not preempt other jobs despite sufficient preemptor", func() {
 		// Remove enqueue action first because it conflicts with preempt.
 		cmc := e2eutil.NewConfigMapCase("volcano-system", "integration-scheduler-configmap")
-		cmc.ChangeBy(func(data map[string]string) (changed bool, changedBefore map[string]string) {
-			vcScheConfStr, ok := data["volcano-scheduler-ci.conf"]
-			Expect(ok).To(BeTrue())
-
-			schedulerConf := &e2eutil.SchedulerConfiguration{}
-			err := yaml.Unmarshal([]byte(vcScheConfStr), schedulerConf)
-			Expect(err).NotTo(HaveOccurred())
-
-			changed = true
-			newActions := strings.TrimPrefix(schedulerConf.Actions, "enqueue, ")
-			if newActions == schedulerConf.Actions {
-				changed = false
+		modifier := func(sc *e2eutil.SchedulerConfiguration) bool {
+			newActions := strings.TrimPrefix(sc.Actions, "enqueue, ")
+			if newActions == sc.Actions {
 				klog.Warning("There is already no enqueue action")
-				return
+				return false
 			}
 
-			schedulerConf.Actions = newActions
-			newVCScheConfBytes, err := yaml.Marshal(schedulerConf)
-			Expect(err).NotTo(HaveOccurred())
-
-			changedBefore = make(map[string]string)
-			changedBefore["volcano-scheduler-ci.conf"] = vcScheConfStr
-			data["volcano-scheduler-ci.conf"] = string(newVCScheConfBytes)
-			return
+			sc.Actions = newActions
+			return true
+		}
+		cmc.ChangeBy(func(data map[string]string) (changed bool, changedBefore map[string]string) {
+			return e2eutil.ModifySchedulerConfig(data, modifier)
 		})
 		defer cmc.UndoChanged()
 
@@ -492,6 +454,105 @@ var _ = Describe("Job E2E Test", func() {
 		err = e2eutil.WaitTasksReady(ctx, preempteeJob, int(rep)/2)
 		Expect(err).NotTo(HaveOccurred())
 		err = e2eutil.WaitTasksReady(ctx, preemptorJob, int(rep)/2)
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("should preempt low priority pod with anti-affinity constraint", func() {
+		// Remove enqueue action first because it conflicts with preempt.
+		cmc := e2eutil.NewConfigMapCase("volcano-system", "integration-scheduler-configmap")
+		modifier := func(sc *e2eutil.SchedulerConfiguration) bool {
+			newActions := strings.TrimPrefix(sc.Actions, "enqueue, ")
+			if newActions == sc.Actions {
+				klog.Warning("There is already no enqueue action")
+				return false
+			}
+
+			sc.Configurations = append(sc.Configurations, e2eutil.Configuration{
+				Name: "preempt",
+				Arguments: map[string]string{
+					"enableTopologyAwarePreemption": "true",
+				},
+			})
+			sc.Actions = newActions
+			return true
+		}
+		cmc.ChangeBy(func(data map[string]string) (changed bool, changedBefore map[string]string) {
+			return e2eutil.ModifySchedulerConfig(data, modifier)
+		})
+		defer cmc.UndoChanged()
+
+		ctx = e2eutil.InitTestContext(e2eutil.Options{
+			PriorityClasses: map[string]int32{
+				highPriority: highPriorityValue,
+				lowPriority:  lowPriorityValue,
+			},
+		})
+
+		slot := e2eutil.OneCPU
+		rep := e2eutil.ClusterSize(ctx, slot)
+
+		// Create low priority pod with specific label
+		lowPriorityLabels := map[string]string{
+			"app": "test-app",
+		}
+		job := &e2eutil.JobSpec{
+			Tasks: []e2eutil.TaskSpec{
+				{
+					Img: e2eutil.DefaultNginxImage,
+					Req: slot,
+					Min: 1,
+					Rep: rep,
+					Labels: map[string]string{
+						schedulingv1beta1.PodPreemptable: "true",
+						"app":                            "test-app",
+					},
+				},
+			},
+		}
+
+		job.Name = "low-priority-job"
+		job.Pri = lowPriority
+		lowPriorityJob := e2eutil.CreateJob(ctx, job)
+		err := e2eutil.WaitTasksReady(ctx, lowPriorityJob, int(rep))
+		Expect(err).NotTo(HaveOccurred())
+
+		// Create high priority pod with anti-affinity rule
+		highPriorityJob := &e2eutil.JobSpec{
+			Tasks: []e2eutil.TaskSpec{
+				{
+					Img: e2eutil.DefaultNginxImage,
+					Req: slot,
+					Min: rep / 2,
+					Rep: rep,
+					Labels: map[string]string{
+						schedulingv1beta1.PodPreemptable: "true",
+					},
+					Affinity: &corev1.Affinity{
+						PodAntiAffinity: &corev1.PodAntiAffinity{
+							RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{
+								{
+									LabelSelector: &metav1.LabelSelector{
+										MatchLabels: lowPriorityLabels,
+									},
+									TopologyKey: "kubernetes.io/hostname",
+								},
+							},
+						},
+					},
+				},
+			},
+		}
+
+		highPriorityJob.Name = "high-priority-job"
+		highPriorityJob.Pri = highPriority
+		highPriorityJobCreated := e2eutil.CreateJob(ctx, highPriorityJob)
+
+		// Verify high priority pod is successfully scheduled
+		err = e2eutil.WaitTasksReady(ctx, highPriorityJobCreated, int(rep)/2)
+		Expect(err).NotTo(HaveOccurred())
+
+		// Verify low priority pod is preempted
+		err = e2eutil.WaitTasksReady(ctx, lowPriorityJob, int(rep)/2)
 		Expect(err).NotTo(HaveOccurred())
 	})
 

@@ -17,6 +17,8 @@ limitations under the License.
 package framework
 
 import (
+	"context"
+
 	k8sframework "k8s.io/kubernetes/pkg/scheduler/framework"
 
 	"volcano.sh/apis/pkg/apis/scheduling"
@@ -90,6 +92,11 @@ func (ssn *Session) AddNodeOrderFn(name string, pf api.NodeOrderFn) {
 	ssn.nodeOrderFns[name] = pf
 }
 
+// AddHyperNodeOrderFn add hyperNode order function
+func (ssn *Session) AddHyperNodeOrderFn(name string, fn api.HyperNodeOrderFn) {
+	ssn.hyperNodeOrderFns[name] = fn
+}
+
 // AddBatchNodeOrderFn add Batch Node order function
 func (ssn *Session) AddBatchNodeOrderFn(name string, pf api.BatchNodeOrderFn) {
 	ssn.batchNodeOrderFns[name] = pf
@@ -153,6 +160,22 @@ func (ssn *Session) AddVictimTasksFns(name string, fns []api.VictimTasksFn) {
 // AddJobStarvingFns add jobStarvingFns function
 func (ssn *Session) AddJobStarvingFns(name string, fn api.ValidateFn) {
 	ssn.jobStarvingFns[name] = fn
+}
+
+func (ssn *Session) AddSimulateAddTaskFn(name string, fn api.SimulateAddTaskFn) {
+	ssn.simulateAddTaskFns[name] = fn
+}
+
+func (ssn *Session) AddSimulateRemoveTaskFn(name string, fn api.SimulateRemoveTaskFn) {
+	ssn.simulateRemoveTaskFns[name] = fn
+}
+
+func (ssn *Session) AddSimulateAllocatableFn(name string, fn api.SimulateAllocatableFn) {
+	ssn.simulateAllocatableFns[name] = fn
+}
+
+func (ssn *Session) AddSimulatePredicateFn(name string, fn api.SimulatePredicateFn) {
+	ssn.simulatePredicateFns[name] = fn
 }
 
 // Reclaimable invoke reclaimable function of the plugins
@@ -665,6 +688,85 @@ func (ssn *Session) PredicateFn(task *api.TaskInfo, node *api.NodeInfo) error {
 	return nil
 }
 
+// SimulateAllocatableFn invoke simulateAllocatableFn function of the plugins
+func (ssn *Session) SimulateAllocatableFn(ctx context.Context, state *k8sframework.CycleState, queue *api.QueueInfo, task *api.TaskInfo) bool {
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			if !isEnabled(plugin.EnabledAllocatable) {
+				continue
+			}
+			caf, found := ssn.simulateAllocatableFns[plugin.Name]
+			if !found {
+				continue
+			}
+			if !caf(ctx, state, queue, task) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// SimulatePredicateFn invoke simulatePredicateFn function of the plugins
+func (ssn *Session) SimulatePredicateFn(ctx context.Context, state *k8sframework.CycleState, task *api.TaskInfo, node *api.NodeInfo) error {
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			if !isEnabled(plugin.EnabledPredicate) {
+				continue
+			}
+			pfn, found := ssn.simulatePredicateFns[plugin.Name]
+			if !found {
+				continue
+			}
+			err := pfn(ctx, state, task, node)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// SimulateRemoveTaskFn invoke simulateRemoveTaskFn function of the plugins
+func (ssn *Session) SimulateRemoveTaskFn(ctx context.Context, state *k8sframework.CycleState, taskToSchedule *api.TaskInfo, taskToRemove *api.TaskInfo, nodeInfo *api.NodeInfo) error {
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			if !isEnabled(plugin.EnabledPreemptable) && !isEnabled(plugin.EnabledAllocatable) {
+				continue
+			}
+			pfn, found := ssn.simulateRemoveTaskFns[plugin.Name]
+			if !found {
+				continue
+			}
+			err := pfn(ctx, state, taskToSchedule, taskToRemove, nodeInfo)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// SimulateAddTaskFn invoke simulateAddTaskFn function of the plugins
+func (ssn *Session) SimulateAddTaskFn(ctx context.Context, state *k8sframework.CycleState, taskToSchedule *api.TaskInfo, taskToAdd *api.TaskInfo, nodeInfo *api.NodeInfo) error {
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			if !isEnabled(plugin.EnabledPreemptable) && !isEnabled(plugin.EnabledAllocatable) {
+				continue
+			}
+			pfn, found := ssn.simulateAddTaskFns[plugin.Name]
+			if !found {
+				continue
+			}
+			err := pfn(ctx, state, taskToSchedule, taskToAdd, nodeInfo)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // PrePredicateFn invoke predicate function of the plugins
 func (ssn *Session) PrePredicateFn(task *api.TaskInfo) error {
 	for _, tier := range ssn.Tiers {
@@ -784,6 +886,29 @@ func (ssn *Session) NodeOrderMapFn(task *api.TaskInfo, node *api.NodeInfo) (map[
 	return nodeScoreMap, priorityScore, nil
 }
 
+// HyperNodeOrderMapFn invoke hyperNode order function of the plugins
+func (ssn *Session) HyperNodeOrderMapFn(job *api.JobInfo, hyperNodes map[string][]*api.NodeInfo) (map[string]map[string]float64, error) {
+	nodeGroupScore := make(map[string]map[string]float64)
+	for _, tier := range ssn.Tiers {
+		for _, plugin := range tier.Plugins {
+			if !isEnabled(plugin.EnabledHyperNodeOrder) {
+				continue
+			}
+			pfn, found := ssn.hyperNodeOrderFns[plugin.Name]
+			if !found {
+				continue
+			}
+			scoreTmp, err := pfn(job, hyperNodes)
+			if err != nil {
+				return nodeGroupScore, err
+			}
+
+			nodeGroupScore[plugin.Name] = scoreTmp
+		}
+	}
+	return nodeGroupScore, nil
+}
+
 // NodeOrderReduceFn invoke node order function of the plugins
 func (ssn *Session) NodeOrderReduceFn(task *api.TaskInfo, pluginNodeScoreMap map[string]k8sframework.NodeScoreList) (map[string]float64, error) {
 	nodeScoreMap := map[string]float64{}
@@ -832,4 +957,9 @@ func (ssn *Session) BuildVictimsPriorityQueue(victims []*api.TaskInfo, preemptor
 		victimsQueue.Push(victim)
 	}
 	return victimsQueue
+}
+
+// RegisterBinder registers the passed binder to the cache, the binder type can be such as pre-binder, post-binder
+func (ssn *Session) RegisterBinder(name string, binder interface{}) {
+	ssn.cache.RegisterBinder(name, binder)
 }

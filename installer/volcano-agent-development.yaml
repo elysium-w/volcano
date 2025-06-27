@@ -20,9 +20,6 @@ rules:
     resources: [ "nodes", "nodes/status" ]
     verbs: [ "get", "list", "watch", "update", "patch" ]
   - apiGroups: [ "" ]
-    resources: [ "secrets" ]
-    verbs: [ "get", "list", "watch" ]
-  - apiGroups: [ "" ]
     resources: [ "configmaps" ]
     verbs: [ "get", "list", "watch", "create", "update" ]
   - apiGroups: [ "" ]
@@ -82,6 +79,11 @@ spec:
         - effect: NoSchedule
           key: volcano.sh/offline-job-evicting
           operator: Exists
+      securityContext:
+        seLinuxOptions:
+          level: s0:c123,c456
+        seccompProfile:
+          type: RuntimeDefault
       serviceAccountName: volcano-agent
       hostNetwork: true
       priorityClassName: system-node-critical
@@ -127,6 +129,16 @@ spec:
       initContainers:
         - name: volcano-agent-init
           image: docker.io/volcanosh/vc-agent:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              add:
+              - CHOWN
+              - DAC_OVERRIDE
+              - FOWNER
+              drop:
+              - ALL
+            runAsUser: 0
           command:
             - /bin/sh
             - '-c'
@@ -148,6 +160,18 @@ spec:
       containers:
         - name: volcano-agent
           image: docker.io/volcanosh/vc-agent:latest
+          securityContext:
+            capabilities:
+              add:
+              - DAC_OVERRIDE
+              - SETUID
+              - SETGID
+              - SETFCAP
+              - BPF
+              drop:
+              - ALL
+            runAsNonRoot: true
+            runAsUser: 1000
           command:
             - /bin/sh
             - '-c'

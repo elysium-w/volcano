@@ -2,7 +2,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.16.4
+    controller-gen.kubebuilder.io/version: v0.17.0
   name: podgroups.scheduling.volcano.sh
 spec:
   group: scheduling.volcano.sh
@@ -88,6 +88,24 @@ spec:
                   if there's not enough resources to start each task, the scheduler
                   will not start anyone.
                 type: object
+              networkTopology:
+                description: NetworkTopology defines the NetworkTopology config, this
+                  field works in conjunction with network topology feature and hyperNode
+                  CRD.
+                properties:
+                  highestTierAllowed:
+                    default: 1
+                    description: HighestTierAllowed specifies the highest tier that
+                      a job allowed to cross when scheduling.
+                    type: integer
+                  mode:
+                    default: hard
+                    description: Mode specifies the mode of the network topology constrain.
+                    enum:
+                    - hard
+                    - soft
+                    type: string
+                type: object
               priorityClassName:
                 description: |-
                   If specified, indicates the PodGroup's priority. "system-node-critical" and
@@ -98,6 +116,7 @@ spec:
                   default.
                 type: string
               queue:
+                default: default
                 description: |-
                   Queue defines the queue to allocate resource for PodGroup; if queue does not exist,
                   the PodGroup will not be scheduled. Defaults to `default` Queue with the lowest weight.
